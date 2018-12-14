@@ -2,10 +2,13 @@ package com.adrienben.demo;
 
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.kafka.clients.consumer.Consumer;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.common.TopicPartition;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.boot.autoconfigure.kafka.ConcurrentKafkaListenerContainerFactoryConfigurer;
+import org.springframework.classify.BinaryExceptionClassifier;
 import org.springframework.context.annotation.Bean;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.kafka.config.ConcurrentKafkaListenerContainerFactory;
@@ -13,13 +16,17 @@ import org.springframework.kafka.core.ConsumerFactory;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.listener.DeadLetterPublishingRecoverer;
 import org.springframework.kafka.listener.ErrorHandler;
+import org.springframework.kafka.listener.MessageListenerContainer;
 import org.springframework.kafka.listener.SeekToCurrentErrorHandler;
 import org.springframework.retry.backoff.FixedBackOffPolicy;
 import org.springframework.retry.policy.SimpleRetryPolicy;
 import org.springframework.retry.support.RetryTemplate;
 
 import java.util.Collections;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BiConsumer;
 
 @Slf4j
 @SpringBootApplication
@@ -74,7 +81,44 @@ public class DemoApp {
 	public ErrorHandler errorHandler(KafkaTemplate<Object, Object> kafkaTemplate) {
 		DeadLetterPublishingRecoverer recoverer = new DeadLetterPublishingRecoverer(kafkaTemplate,
 				(r, e) -> new TopicPartition("dlq", r.partition()));
-		return new SeekToCurrentErrorHandler(recoverer, 1);
+		return new ExtendedSeekToCurrentErrorHandler(recoverer, MAX_ATTEMPTS,
+				Collections.singletonMap(RetryableException.class, true), true);
+	}
+
+	private static class ExtendedSeekToCurrentErrorHandler extends SeekToCurrentErrorHandler {
+
+		private final BiConsumer<ConsumerRecord<?, ?>, Exception> recoverer;
+		private final BinaryExceptionClassifier retryableClassifier;
+
+		public ExtendedSeekToCurrentErrorHandler(
+				BiConsumer<ConsumerRecord<?, ?>, Exception> recoverer,
+				int maxFailures,
+				Map<Class<? extends Throwable>, Boolean> retryableExceptions,
+				boolean traverseCauses
+		) {
+			super(recoverer, maxFailures);
+			this.recoverer = recoverer;
+			this.retryableClassifier = new BinaryExceptionClassifier(retryableExceptions, false);
+			this.retryableClassifier.setTraverseCauses(traverseCauses);
+		}
+
+		@Override
+		public void handle(
+				Exception thrownException,
+				List<ConsumerRecord<?, ?>> records,
+				Consumer<?, ?> consumer,
+				MessageListenerContainer container
+		) {
+			if (isRetryable(thrownException)) {
+				super.handle(thrownException, records, consumer, container);
+			} else if (!records.isEmpty()) {
+				recoverer.accept(records.get(0), thrownException);
+			}
+		}
+
+		private boolean isRetryable(Throwable throwable) {
+			return retryableClassifier.classify(throwable);
+		}
 	}
 
 	public static void main(String[] args) {
